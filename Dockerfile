@@ -96,17 +96,30 @@ WORKDIR /workspace
 
 # 6a. 初始化 profile 并预置 pnpm 配置（patchedDependencies 必须在安装前就位，
 #     否则 pnpm 不会应用补丁）
+#
+# ⚠️ 只有一个 profile，名叫 main。它同时承担 Web 界面和 QQ 机器人：
+#
+#     bundles = dsh-base + dsh-web-app + 各 IM/人设/记忆插件
+#
+# 为什么不再拆成 web / qqbot 两个 profile：
+#   两个 profile = 两个 dsh 进程 = 两份内存里的会话表。
+#   QQ 的会话活在 qqbot 进程，Web 进程只能从磁盘读到 header，
+#   读不到活着的 agent —— 于是工作区归不上、模型选择器读不到、
+#   两边同时写还抢跨进程锁。合并成一个宿主后这些全部由上游自己解决。
+#
+# dsh-web-app 必须排在 dsh-base 之后：它是 web 表面补丁层。
 RUN set -eux; \
-    P="${DSH_HOME}/profiles/qqbot"; \
+    P="${DSH_HOME}/profiles/main"; \
     mkdir -p "$P/patches"; \
     cp /opt/dsh/image/profiles/pnpm-workspace.yaml "$P/pnpm-workspace.yaml"; \
     cp /opt/dsh/image/patch/*.patch "$P/patches/"; \
     printf '%s\n' \
       '{' \
-      '  "name": "dsh-profile-qqbot",' \
+      '  "name": "dsh-profile-main",' \
       '  "private": true,' \
       '  "dsh": { "profile": { "bundles": [' \
       '    "@deepseek-ai/dsh-base",' \
+      '    "@deepseek-ai/dsh-web-app",' \
       '    "@tencent-connect/dsh-qqbot",' \
       '    "dsh-persona-dafeiyu",' \
       '    "dsh-proactive",' \
@@ -115,30 +128,49 @@ RUN set -eux; \
       '}' > "$P/package.json"
 
 # 6b. 装插件（含补丁）
+#
+# ⚠️ dsh-speak-up 已移除：它无法唤醒冷会话（只能对活着的 agent 说话，
+#    而 QQ 插件 30 分钟回收会话），且它依赖 webServer 这个硬编码必需 id。
 RUN set -eux; \
-    cd "${DSH_HOME}/profiles/qqbot"; \
+    cd "${DSH_HOME}/profiles/main"; \
     CI=true pnpm add \
-        "@tencent-connect/dsh-qqbot@0.5.2" \
+        "@tencent-connect/dsh-qqbot@0.5.3" \
         dsh-persona-dafeiyu \
         dsh-proactive \
-        meow-memory \
-        "dsh-speak-up@github:Yuuyuko-uu/dsh-speak-up"; \
+        meow-memory; \
     pnpm store prune || true
 
 # 6c. 本地插件（不是 npm 包，拷进 profile 的 plugins 目录）
+#
+# 只留 worldbook —— 酒馆式世界书，上游没有等价物。
+# config-sync / log-console / workspace-bootstrap 已全部删除：
+#   - config-sync       单进程后不需要跨 profile 同步
+#   - log-console       单进程的 dsh web 自带日志输出
+#   - workspace-bootstrap  attachSession 由 api-session-controller 自己做
 RUN set -eux; \
-    P="${DSH_HOME}/profiles/qqbot/plugins"; \
+    P="${DSH_HOME}/profiles/main/plugins"; \
     mkdir -p "$P"; \
     cp -r /opt/dsh/image/plugins/worldbook "$P/worldbook"; \
-    cp -r /opt/dsh/image/plugins/log-console "$P/log-console"; \
-    cp -r /opt/dsh/image/plugins/config-sync "$P/config-sync"; \
-    cp -r /opt/dsh/image/plugins/workspace-bootstrap "$P/workspace-bootstrap"
+    cp -r /opt/dsh/image/plugins/log-console "$P/log-console"
 
 # 6d. 验证补丁确实应用了（构建期就失败，别等到运行）
 RUN set -eux; \
-    F="${DSH_HOME}/profiles/qqbot/node_modules/@tencent-connect/dsh-qqbot/dist/transport/outbound.js"; \
+    F="${DSH_HOME}/profiles/main/node_modules/@tencent-connect/dsh-qqbot/dist/transport/outbound.js"; \
     grep -q "PATCH" "$F" || { echo "ERROR: qqbot patch not applied"; exit 1; }; \
     echo "patch verified"
+
+# 6d-2. 验证 profile 组合能解析出 webServer + im-qqbot 两个行
+#
+# 这是单进程架构的构建期断言：少了 webServer，端内绑定页不注册、
+# Web UI 不存在；少了 im-qqbot，机器人不存在。两者必须在同一个树里。
+RUN set -eux; \
+    cd "${DSH_HOME}/profiles/main"; \
+    dsh --profile main --dump-config 2>/dev/null > /tmp/composed.yml || { echo "ERROR: --dump-config failed"; exit 1; }; \
+    grep -q "id: webserver" /tmp/composed.yml || { echo "ERROR: webserver 行缺失（dsh-web-app bundle 没挂上）"; exit 1; }; \
+    grep -q "id: im-qqbot"  /tmp/composed.yml || { echo "ERROR: im-qqbot 行缺失（qqbot bundle 没挂上）"; exit 1; }; \
+    grep -q "id: agent-default-model" /tmp/composed.yml || { echo "ERROR: agent-default-model 行缺失"; exit 1; }; \
+    echo "profile composition verified: webserver + im-qqbot + agent-default-model"; \
+    rm -f /tmp/composed.yml
 
 # 6e. 保存一份 profile 骨架，供首次启动时铺到挂载目录
 # 为什么需要：运行期 data/profiles 是宿主机 bind mount，会把镜像里的
@@ -151,11 +183,11 @@ RUN set -eux; \
 # 机器人根本起不来。entrypoint 会用这里存的骨架在首次启动时补齐。
 RUN set -eux; \
     mkdir -p /opt/dsh/image/skeleton; \
-    cp -a "${DSH_HOME}/profiles/qqbot" /opt/dsh/image/skeleton/qqbot; \
-    rm -rf /opt/dsh/image/skeleton/qqbot/cordis.patch.yml; \
+    cp -a "${DSH_HOME}/profiles/main" /opt/dsh/image/skeleton/main; \
+    rm -rf /opt/dsh/image/skeleton/main/cordis.patch.yml; \
     printf '# dsh profile root — an empty entry list.\n[]\n' \
-        > /opt/dsh/image/skeleton/qqbot/cordis.yml; \
-    du -sh /opt/dsh/image/skeleton/qqbot
+        > /opt/dsh/image/skeleton/main/cordis.yml; \
+    du -sh /opt/dsh/image/skeleton/main
 
 # ── 7. 入口 & 辅助命令 ────────────────────────────────────────────
 USER root
@@ -168,9 +200,13 @@ RUN set -eux; \
     ln -sf /opt/dsh/image/scripts/dsh-ctl.sh /usr/local/bin/dsh-status; \
     ln -sf /opt/dsh/image/scripts/dsh-add-alarm.sh /usr/local/bin/dsh-add-alarm; \
     ln -sf /opt/dsh/image/scripts/dsh-test.sh /usr/local/bin/dsh-test; \
-    ln -sf /opt/dsh/image/scripts/dsh-model.sh /usr/local/bin/dsh-model; \
     ln -sf /opt/dsh/image/scripts/dsh-render.sh /usr/local/bin/dsh-render; \
+    ln -sf /opt/dsh/image/scripts/dsh-verify.sh /usr/local/bin/dsh-verify; \
+    ln -sf /opt/dsh/image/scripts/dsh-launch.sh /usr/local/bin/dsh-launch; \
     chown -R 1000:1000 "${DSH_HOME}"
+
+# dsh-model 已移除：切模型改在 Web 顶部选择器里点，直接落 agent-default-model，
+# 不需要再维护一个「改 web profile 再等同步」的脚本。
 
 USER 1000:1000
 WORKDIR /workspace
@@ -178,6 +214,3 @@ EXPOSE 8766
 
 # tini 做 PID 1：正确转发信号、回收僵尸
 ENTRYPOINT ["/usr/bin/tini", "--", "/opt/dsh/image/scripts/entrypoint.sh"]
-
-
-

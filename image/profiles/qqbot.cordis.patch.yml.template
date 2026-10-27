@@ -1,22 +1,40 @@
 # ════════════════════════════════════════════════════════════════════
-#  qqbot profile 配置模板
+#  profile 配置模板（单一宿主：Web + QQ 机器人同进程）
 #
-#  镜像构建时由 image/scripts/entrypoint.sh 从本模板生成实际配置到
-#  DSH_HOME/profiles/qqbot/cordis.patch.yml（仅当目标不存在时）。
+#  为什么只有一个 profile：
 #
-#  用户需要填的只有两个环境变量：
-#    QQBOT_APPID / QQBOT_SECRET  —— QQ 开放平台机器人凭据
-#    DEEPSEEK_API_KEY / *       —— 模型服务商凭据（见下方 providers 段）
+#  旧架构是「dsh web」和「dsh --profile qqbot」两个进程共用一份 DSH_HOME。
+#  结果 QQ 的会话活在 A 进程，Web 只能从磁盘读到它的 header，读不到活着的
+#  agent —— 于是：
+#     - 会话不归工作区（attachSession 只在 Web 自己建会话时调用）
+#     - Web 顶部模型选择器读不到 QQ 会话的模型
+#     - 两边同时写一个会话会抢跨进程写锁，Web 就另开一个新会话
+#     - QQ 插件没有 webServer，端内绑定页永远不注册
 #
-#  工具变量由 entrypoint 用 envsubst 替换：
-#    QQBOT_APPID / QQBOT_SECRET
+#  合并成一个 dsh web 宿主后，以上全部由上游自己解决，不需要任何适配层。
+#
+#  用户需要填的只有：
+#    QQBOT_APPID / QQBOT_SECRET  —— QQ 开放平台机器人凭据（可留空走扫码）
+#    模型服务商 / API key          —— 在 Web「设置 → 模型」里填
+#
+#  entrypoint 用 envsubst 替换的变量：
+#    QQBOT_APPID QQBOT_SECRET DSH_GROUP_MODE DSH_GROUP_ALLOW_INLINE
+#    DSH_VIP_SENDERS_INLINE DSH_SUBAGENT_MAX_DEPTH DSH_SUBAGENT_MAX_PARALLEL
+#    DSH_SUBAGENT_MODELS_FLOW
 # ════════════════════════════════════════════════════════════════════
 
 # ── QQ 机器人接入 ──────────────────────────────────────────────────
+#
+# appId / appSecret 留空 = 未绑定态，启动后插件进入扫码引导，
+# 端内绑定页在 Web 侧栏里（路由 /qqbot/im-qqbot/bind），扫完即生效不重启。
+#
+# ⚠️ 不要在这里写死凭据：resolveEnv() 是「config 优先、env 兜底」，
+#    一旦写死，扫码结果就永远被它压掉 —— 这就是旧版本「扫完码必须重启
+#    容器」的根因。
 - id: im-qqbot
   config:
     appId: '${QQBOT_APPID}'
-    appSecret: ${QQBOT_SECRET}
+    appSecret: '${QQBOT_SECRET}'
     requireMention: true
 
     # 重点人员：这些人没 @ 也会把她叫起来看一眼（不一定回，由她自己判断）。
@@ -54,12 +72,19 @@
       - 说点自己的事、吐槽两句、玩梗。
       - 但别每次都找话题，也别硬接。
 
-    # 视觉：插件默认 vision.enabled=false，工具不会注册。
-    # 沙箱放开到 danger-full-access 后，读图路径不受工作区限制。
+    # 视觉：让模型能看 QQ 里发来的图片（qqbot_describe_image 工具）。
+    #
+    # ⚠️ provider / model 是**必填**，缺一个就不注册工具，只在日志里留一行
+    #    「vision.provider/model 未配置」的 warn —— 很容易被忽略。
+    #    上游并不支持"留空跟随会话模型"，那是我想当然。
+    #
+    # ⚠️ 这里必须是真实存在的路由：旧版写死了 cpa/deepseek-v4.1-flash，
+    #    而 providers 是空的、根本没有 cpa 这个路由，所以读图必然失败。
+    #    deepseek-official/deepseek-flash 支持图片输入，是 dsh-base 内置的。
     vision:
       enabled: true
-      provider: cpa
-      model: deepseek-v4.1-flash
+      provider: deepseek-official
+      model: deepseek-flash
       maxBytes: 10485760
       maxTokens: 1024
       timeoutMs: 120000
@@ -78,9 +103,6 @@
       #   open      任何群都能触发（仍受 requireMention 约束：只有 @ 才回）
       #   allowlist 只有 groupAllow 里的群 openid 才响应
       #   disabled  全部丢掉（不要用，会让人以为"机器人死了"）
-      #
-      # 默认 open：加个新群不用改配置，也不用去查群 openid。
-      # 想收紧就把 .env 的 DSH_GROUP_MODE 设成 allowlist 并填 DSH_GROUP_ALLOW。
       groupMode: ${DSH_GROUP_MODE}
       groupAllow: ${DSH_GROUP_ALLOW_INLINE}
     debug: false
@@ -89,21 +111,23 @@
 #
 # **服务商配置不写在这里。**
 #
-# DSH 自带 pi-ai 内置目录（42 个服务商：DeepSeek / OpenAI / Anthropic /
-# Kimi / Moonshot / 通义 …），baseUrl、模型目录、上下文窗口、是否支持
-# 图片和推理都在目录里。llm-pi-ai 的 providers 默认就是空对象，照样能用
-# 内置目录。
+# dsh-base 本来就已经挂好了 llm-deepseek（路由 deepseek-official）、
+# 凭据存储、以及休眠的 llm-pi-ai。用户在 Web「设置 → 模型」里挑服务商、
+# 填 API key、选模型即可 —— 这些写进 settings 分区，每次请求实时解析。
 #
-# 用户在 Web「设置 → 模型」里挑服务商、填 API key、选模型即可。
-# config-sync 每 5 秒把它同步到本 profile（以 Web 为准）。
+# 因为 Web 和 QQ 现在是同一个进程，**不存在配置同步问题**。
 #
-# agent-default-model 是必填项（provider + model 都 required），所以留一条。
-# deepseek-flash = DeepSeek V4.1 Flash，1M 上下文，支持图片和推理。
+# agent-default-model 是必填项（provider + model 都 required），所以留一条
+# 作为初始值。Web 顶部选择器改模型时写的就是这里，它是唯一真源。
+#
+# ⚠️ provider 必须是 deepseek-official：那是 llm-deepseek 适配器注册的
+#    路由名。写 deepseek 会得到一个「没有适配器」的悬空路由。
 - id: agent-default-model
   name: '@deepseek-ai/dsh-agent-default-model'
   config:
-    provider: deepseek
+    provider: deepseek-official
     model: deepseek-flash
+    reasoningEffort: high
 
 # ── 会话默认权限：完全访问 ────────────────────────────────────────
 # 容器本身就是隔离边界。默认 workspace-write 会拦掉 /workspace 以外的读取，
@@ -124,19 +148,104 @@
         sandbox: danger-full-access
         approval: never
 
-# ── 补充服务：workspaceRegistry ──────────────────────────────────
+# ── 日志输出 ──────────────────────────────────────────────────────
 #
-# dsh-proactive 的 inject 里有 workspaceRegistry，纯 CLI profile 默认不加载
-# dsh-workspace，不补的话 dsh-proactive 会 pending 不激活，定时唤醒就用不了。
+# DSH 的 ctx.logger 只把日志交给注册过的 exporter，而 dsh web 这个 app
+# 只输出自己关心的内容 —— qqbot 插件的
+#   Processing: scope=... body="..."
+#   Access blocked: ...
+#   [trigger] skip group msg (...)
+# 全部被静默丢弃，表现为「消息没反应，日志一片空白」，完全无法排查。
 #
-# 注：不需要 webServer。之前为 dsh-speak-up 补过，但 speak-up 已移除 ——
-#     它无法唤醒冷会话（只能对活着的 agent 说话，而 QQ 插件 30 分钟回收会话），
-#     且 webServer 是 DSH 硬编码的必需插件 id，插入同名条目时端口冲突会让
-#     整个 DSH 启动失败。
+# 这个插件注册一个 exporter 把日志写到 stderr，docker compose logs 就能看到。
+# 级别：error=0 info=1 warn=2 debug=3（threshold 越小越严）
+# 想看触发/跳过原因用 3；嫌吵调到 2。
 - insert:
-    - id: workspace
-      name: '@deepseek-ai/dsh-workspace'
+    - id: log-console
+      name: './plugins/log-console/index.js'
+      config:
+        level: 3
 
+# ── HMR：配置热重载 ──────────────────────────────────────────────
+#
+# ⚠️ 必须开 usePolling，否则在 Docker Desktop (Windows/macOS) 上完全不工作。
+#
+#   原因：bind mount 的宿主机目录不会把 inotify 事件传进容器。
+#   chokidar 默认用 inotify 后端，于是**一个事件都收不到**，配置改了不重载、
+#   而且不报任何错 —— 表现为「扫码后一直卡在 saving」「改了配置没反应」。
+#
+#   实测（同一份配置文件）：
+#     usePolling: false → 写入后 5 秒内 0 个事件
+#     usePolling: true  → 立刻收到 EVENT: change
+#
+#   代价：每 interval 毫秒 stat 一次文件。对单个配置文件和 list 出来的目录
+#   来说开销可忽略（几百微秒），换来的确定性远大于开销。
+#
+# interval 选 1000ms：比默认 100ms 省资源，对「改完配置等人看效果」这种
+# 交互场景足够快。
+- id: hmr
+  name: '@deepseek-ai/dsh-hmr'
+  config:
+    usePolling: true
+    interval: 1000
+
+# ── 凭据不写进 profile 配置 ──────────────────────────────────────
+#
+# image/patch 里的 persist.js 补丁把「写入 profile 配置」改成了「写独立文件 +
+# 返回 false」，所以本文件永远不会被扫码操作改写，注释和 insert 条目都安全。
+#
+# 独立文件由 entrypoint 在启动时读出来注入 QQBOT_APPID / QQBOT_SECRET。
+# 因此下面 im-qqbot 的 appId/appSecret 保持空字符串 —— 它们是 env 的兜底位。
+
+# ── 日志输出 ──────────────────────────────────────────────────────
+#
+# DSH 的 ctx.logger 只把日志交给注册过的 exporter，而 dsh web 这个 app
+# 只输出自己关心的内容 —— qqbot 插件的
+#   Processing: scope=... body="..."
+#   Access blocked: ...
+#   [trigger] skip group msg (...)
+# 全部被静默丢弃，表现为「消息没反应，日志一片空白」，完全无法排查。
+#
+# 这个插件注册一个 exporter 把日志写到 stderr，docker compose logs 就能看到。
+# 级别：error=0 info=1 warn=2 debug=3（threshold 越小越严）
+# 想看触发/跳过原因用 3；嫌吵调到 2。
+- insert:
+    - id: log-console
+      name: './plugins/log-console/index.js'
+      config:
+        level: 3
+
+# ── HMR：配置热重载 ──────────────────────────────────────────────
+#
+# ⚠️ 必须开 usePolling，否则在 Docker Desktop (Windows/macOS) 上完全不工作。
+#
+#   原因：bind mount 的宿主机目录不会把 inotify 事件传进容器。
+#   chokidar 默认用 inotify 后端，于是**一个事件都收不到**，配置改了不重载、
+#   而且不报任何错 —— 表现为「扫码后一直卡在 saving」「改了配置没反应」。
+#
+#   实测（同一份配置文件）：
+#     usePolling: false → 写入后 5 秒内 0 个事件
+#     usePolling: true  → 立刻收到 EVENT: change
+#
+#   代价：每 interval 毫秒 stat 一次文件。对单个配置文件和 list 出来的目录
+#   来说开销可忽略（几百微秒），换来的确定性远大于开销。
+#
+# interval 选 1000ms：比默认 100ms 省资源，对「改完配置等人看效果」这种
+# 交互场景足够快。
+- id: hmr
+  name: '@deepseek-ai/dsh-hmr'
+  config:
+    usePolling: true
+    interval: 1000
+
+# ── 配置保护 ──────────────────────────────────────────────────────
+#
+# 上游 @tencent-connect/dsh-qqbot 的 setup/persist.js 在扫码成功后用
+# yaml.dump() 整体覆盖本文件 —— 那会抹掉所有注释、丢掉 insert 出来的条目、
+# 并把 Schema 补全值固化下来。
+#
+# 这个插件检测到改写后：捞出凭据存到独立文件 → 从模板恢复本文件。
+# 上游哪天修好了，它会因为「模板与文件一致」而空转，不需要删除。
 # ── 酒馆式世界书 ──────────────────────────────────────────────────
 - insert:
     - id: worldbook
@@ -156,14 +265,11 @@
   config:
     reflect: false
     reflectTurns: 50
-    # 记忆语言：注入的导引文案、记忆条目都用这种语言写。
-    # 想换语言改这里（'zh' 中文 / 'en' 英文），然后重载插件。
     promptLang: 'zh'
-
 
 # ── 工具执行模式：ptc ────────────────────────────────────────────
 # native：模型直接调 25 个工具，逐个 function call。
-# ptc   ：25 个工具收进一个 run_code，模型写代码从代码里调用 ——
+# ptc   ：25 个工具收进一个 run_code，模型从代码里调用 ——
 #         能并行（maxParallelSubCalls）、省 token（只保留 1 份 schema）。
 # 适合「在容器里干活」的场景。聊天端已用 groupPrompt 约束不贴代码块。
 - id: tools
@@ -174,7 +280,6 @@
 
 # ── 子智能体：递归层级 / 并行数 ───────────────────────────────────
 # maxDepth            递归层级上限：子智能体再派子智能体，最多几层。
-#                     插件默认 1（子智能体不能再派），这里由 DSH_SUBAGENT_MAX_DEPTH 控制。
 # maxActiveSubagents  同时最多跑几个子智能体（插件默认 8）。
 - id: subagent
   name: '@deepseek-ai/dsh-subagent'
@@ -182,70 +287,19 @@
     maxDepth: ${DSH_SUBAGENT_MAX_DEPTH}
     maxActiveSubagents: ${DSH_SUBAGENT_MAX_PARALLEL}
 
-# ── 子智能体：模型授权表（回退表）────────────────────────────────
+# ── 子智能体：模型授权表 ─────────────────────────────────────────
 #
-# 对应 Web UI 里「设置子智能体的递归层级、数量和模型 / 允许 Agent 为子智能体选择模型」。
+# ⚠️ enabled=true 时 allowedModels **不能为空**，否则上游直接抛：
+#      enabled subagent model selection requires at least one allowed model
+#    而这条路径在「新建会话」里，所以后果是 **Web 里所有会话都创建不出来**，
+#    表现是输入框点不了、模型切不了 —— 完全看不出根因在子智能体配置上。
 #
-# allowedModels 就是回退表：
-#   开启后主 Agent 可以为每个子智能体单独挑 provider / model / 推理强度，
-#   并按这里的顺序从上往下选 —— 一个不行（限流、报错）自动换下一个。
-#
-# 想改优先级：改 .env 里 DSH_SUBAGENT_MODELS 的顺序，然后
-#   DSH_RENDER_FORCE=1 docker compose up -d
-#
-# 留空（DSH_SUBAGENT_MODELS 不填）= allowedModels 为空列表，
-# Agent 不能给子智能体选模型，全部跟随默认模型。
+# 所以 enabled 必须跟着 allowedModels 一起变：
+#   填了 DSH_SUBAGENT_MODELS → 开启，白名单生效
+#   留空                     → 关闭，子智能体全部跟随主模型
 - insert:
     - id: subagent-model-selection-settings
       name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
       config:
-        enabled: true
+        enabled: ${DSH_SUBAGENT_ENABLED}
         allowedModels: ${DSH_SUBAGENT_MODELS_FLOW}
-
-# ── Web 配置 → QQ 机器人 跟随（唯一的兼容层）─────────────────────
-#
-# QQ 机器人和 Web 是两个独立 profile、两个独立进程，配置各存各的：
-#   data/profiles/web/cordis.patch.yml    ← Web 设置页改这份
-#   data/profiles/qqbot/cordis.patch.yml  ← QQ 机器人读这份
-#
-# 所以「在 Web 里配服务商 / 选默认模型」对 QQ 机器人没有效果。
-# 这个插件每 5 秒比对一次，以 Web 为准把这些条目同步过来。
-#
-# 不同步 permission：qqbot 必须是 danger-full-access（容器里要读写文件、
-# 装包），跟 Web 同步会让机器人直接废掉。
-- insert:
-    - id: config-sync
-      name: './plugins/config-sync/index.js'
-      config:
-        intervalMs: 5000
-# ── 插件日志输出 ──────────────────────────────────────────────────
-# DSH 的 ctx.logger 只把日志交给注册过的 exporter，而 qqbot 这个 app
-# 一个都没装 —— 所有插件日志被静默丢弃。于是「群里没反应」时日志是空的，
-# 没法判断到底是没收到消息、被白名单拦了、还是触发了但选择不回。
-#
-# 这个插件把日志写到 stderr，`docker compose logs dsh` 就能看到。
-# 级别 threshold：2=只看 warn/error，3=加 debug（能看到 trigger/skip 原因）。
-# 嫌吵就把 level 调成 2。
-- insert:
-    - id: log-console
-      name: 'file:///home/node/.dsh/profiles/qqbot/plugins/log-console/index.js'
-      config:
-        level: 3
-
-# ── 默认工作区 ───────────────────────────────────────────────────
-#
-# QQ 插件建会话时只把 cwd 写进 meta，不写 workspaceId；而 Web 的会话
-# 列表是按 workspaceRegistry 分组的，registry 里没有对应记录，QQ 来的
-# 会话就显示「未分配工作区」。
-#
-# 这个插件启动时调 workspaceRegistry.initializeDefault('/workspace')：
-#   - 把 /workspace 注册成**默认工作区**（写 global.defaultWorkspaceId）
-#   - QQ 会话的 cwd 也是 /workspace，于是两边归到同一个工作区
-#
-# initializeDefault 只在 registry 和会话历史都为空时动手，重复调用无害。
-- insert:
-    - id: workspace-bootstrap
-      name: './plugins/workspace-bootstrap/index.js'
-      config:
-        directories:
-          - /workspace

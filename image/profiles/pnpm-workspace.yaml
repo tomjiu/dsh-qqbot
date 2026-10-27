@@ -14,7 +14,7 @@ onlyBuiltDependencies:
 # 之类的内容被当成聊天发到 QQ。
 # 生成方式见 tools/make-patch.sh；升级插件后需重新生成。
 patchedDependencies:
-  '@tencent-connect/dsh-qqbot@0.5.2': patches/@tencent-connect__dsh-qqbot@0.5.2.patch
+  '@tencent-connect/dsh-qqbot@0.5.3': patches/@tencent-connect__dsh-qqbot@0.5.3.patch
 
 # 固定 pnpm store 位置。
 #

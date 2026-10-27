@@ -16,8 +16,20 @@
 #   envsubst 无法把一个变量展开成多行缩进的 YAML 列表，只能靠逐行判断替换。
 set -Eeuo pipefail
 
+# ── 变量默认值 ──────────────────────────────────────────────────
+# 本脚本是 set -u（未定义变量即退出）。在 docker compose 里这些变量由
+# compose 注入，但直接 docker run 时一个都没有 —— 那时第一次读
+# DSH_GROUP_MODE 就会以 unbound variable 退出，容器起不来且原因难找。
+# 这里统一兜底，让脚本在任何环境下都能跑完。
+: "${DSH_GROUP_MODE:=open}"
+: "${DSH_GROUP_ALLOW:=}"
+: "${DSH_VIP_SENDERS:=}"
+: "${DSH_SUBAGENT_MODELS:=}"
+: "${QQBOT_APPID:=}"
+: "${QQBOT_SECRET:=}"
+
 DSH_HOME="${DSH_HOME:-/home/node/.dsh}"
-PROFILE="${QQ_PROFILE:-qqbot}"
+PROFILE="${MAIN_PROFILE:-main}"
 TPL="/opt/dsh/image/profiles/qqbot.cordis.patch.yml.template"
 TARGET="${DSH_HOME}/profiles/${PROFILE}/cordis.patch.yml"
 FORCE="${1:-}"
@@ -137,7 +149,7 @@ DSH_GROUP_ALLOW_INLINE="$(render_yaml_flow "${DSH_GROUP_ALLOW:-}")"
 if [ -n "${DSH_GROUP_ALLOW_INLINE}" ]; then export DSH_GROUP_ALLOW_INLINE; fi
 # 只有真的启用 allowlist 才需要白名单。默认 groupMode=open 时空表是正常的，
 # 不该报警（以前这里无条件 warn，误导性很强）。
-if [ "${DSH_GROUP_MODE}" = "allowlist" ] && [ -z "${DSH_GROUP_ALLOW:-}" ]; then
+if [ "${DSH_GROUP_MODE:-open}" = "allowlist" ] && [ -z "${DSH_GROUP_ALLOW:-}" ]; then
     echo "WARN: DSH_GROUP_MODE=allowlist 但 DSH_GROUP_ALLOW 为空" >&2
     echo "      插件会把空数组当成 ['*']，等于放行所有群 —— 请填群 openid。" >&2
 fi
@@ -147,9 +159,8 @@ VIP_SENDERS_YAML="$(render_yaml_list "${DSH_VIP_SENDERS:-}" 6 '''')"
 # 用单行 flow 风格：多行列表在空值时会留下未替换的占位符，YAML 直接断掉。
 DSH_VIP_SENDERS_INLINE="$(render_yaml_flow "${DSH_VIP_SENDERS:-}")"
 export DSH_VIP_SENDERS_INLINE
-if [ -z "${DSH_VIP_SENDERS:-}" ]; then
-    echo "WARN: DSH_VIP_SENDERS 为空 —— 重点人员触发不会生效（仅 @ 能叫到她）" >&2
-fi
+# 重点人员留空 = 只认 @，属正常配置，不打 WARN。
+
 
 # 子智能体模型授权表（顺序即回退顺序）
 SUBAGENT_MODELS_YAML="$(render_model_routes "${DSH_SUBAGENT_MODELS:-}" 10)"
@@ -158,6 +169,15 @@ export DSH_SUBAGENT_MODELS_FLOW
 if [ -z "${DSH_SUBAGENT_MODELS:-}" ]; then
     echo "INFO: DSH_SUBAGENT_MODELS 为空 —— 子智能体不启用模型选择（跟随默认模型）" >&2
 fi
+# 子智能体模型选择：只有真的填了白名单才能 enabled=true。
+# 上游校验 enabled && allowedModels.length===0 直接抛错，而它在「新建会话」路径上，
+# 会让 Web 里所有会话都创建失败（表现为输入框点不了、模型切不了）。
+if [ -n "${DSH_SUBAGENT_MODELS:-}" ]; then
+    export DSH_SUBAGENT_ENABLED=true
+else
+    export DSH_SUBAGENT_ENABLED=false
+fi
+
 export DSH_SUBAGENT_MAX_DEPTH="${DSH_SUBAGENT_MAX_DEPTH:-3}"
 export DSH_SUBAGENT_MAX_PARALLEL="${DSH_SUBAGENT_MAX_PARALLEL:-4}"
 
@@ -183,7 +203,7 @@ fi
 # ⚠️ ga / vip 用 -v 传入时，末尾换行已被 $(...) 剥掉
 #    （bash 命令替换会去掉所有尾部换行）。所以用 print 而不是 printf "%s"，
 #    由 awk 自己补回车 —— 否则最后一条列表项会和下一行粘在一起，YAML 就坏了。
-envsubst '${QQBOT_APPID} ${QQBOT_SECRET} ${DSH_SUBAGENT_MAX_DEPTH} ${DSH_SUBAGENT_MAX_PARALLEL} ${DSH_GROUP_MODE} ${DSH_GROUP_ALLOW_INLINE} ${DSH_VIP_SENDERS_INLINE} ${DSH_SUBAGENT_MODELS_FLOW}' < "$TPL" | \
+envsubst '${QQBOT_APPID} ${QQBOT_SECRET} ${DSH_SUBAGENT_ENABLED} ${DSH_SUBAGENT_MAX_DEPTH} ${DSH_SUBAGENT_MAX_PARALLEL} ${DSH_GROUP_MODE} ${DSH_GROUP_ALLOW_INLINE} ${DSH_VIP_SENDERS_INLINE} ${DSH_SUBAGENT_MODELS_FLOW}' < "$TPL" | \
 awk -v ga="$GROUP_ALLOW_YAML" -v vip="$VIP_SENDERS_YAML" -v sm="$SUBAGENT_MODELS_YAML" '
     $0 == "${DSH_GROUP_ALLOW_YAML}"    { print ga;  next }
     $0 == "${DSH_VIP_SENDERS_YAML}"    { print vip; next }

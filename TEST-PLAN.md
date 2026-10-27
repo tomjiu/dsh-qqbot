@@ -20,16 +20,16 @@
 
 ```bash
 # 记录补丁基线（不是“有没有”，而是“补丁后再装回来是否一模一样”）
-docker compose exec dsh bash -lc 'sha256sum ~/.dsh/profiles/qqbot/node_modules/@tencent-connect/dsh-qqbot/dist/transport/inbound.js'
+docker compose exec dsh bash -lc 'sha256sum ~/.dsh/profiles/main/node_modules/@tencent-connect/dsh-qqbot/dist/transport/inbound.js'
 
 # 真正删掉整个依赖树（不是 pnpm install，那是空跑）
-docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/qqbot && rm -rf node_modules'
+docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/main && rm -rf node_modules'
 
 # 从零重装
-docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/qqbot && CI=true pnpm install 2>&1 | tail -3'
+docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/main && CI=true pnpm install 2>&1 | tail -3'
 
 # 再取一次哈希
-docker compose exec dsh bash -lc 'sha256sum ~/.dsh/profiles/qqbot/node_modules/@tencent-connect/dsh-qqbot/dist/transport/inbound.js'
+docker compose exec dsh bash -lc 'sha256sum ~/.dsh/profiles/main/node_modules/@tencent-connect/dsh-qqbot/dist/transport/inbound.js'
 ```
 
 **判定**
@@ -311,7 +311,7 @@ docker compose logs --since 1m dsh | grep -E "a service exited|Bot ready"
 
 ```bash
 # 故意写坏配置
-docker compose exec dsh bash -lc 'echo "  bad: [unclosed" >> ~/.dsh/profiles/qqbot/cordis.patch.yml'
+docker compose exec dsh bash -lc 'echo "  bad: [unclosed" >> ~/.dsh/profiles/main/cordis.patch.yml'
 docker compose restart dsh
 sleep 30
 docker compose logs --since 1m dsh | grep -iE "error|failed|invalid"
@@ -322,7 +322,7 @@ docker compose logs --since 1m dsh | grep -iE "error|failed|invalid"
 **恢复**
 
 ```bash
-docker compose exec dsh bash -lc 'sed -i "/bad: \[unclosed/d" ~/.dsh/profiles/qqbot/cordis.patch.yml'
+docker compose exec dsh bash -lc 'sed -i "/bad: \[unclosed/d" ~/.dsh/profiles/main/cordis.patch.yml'
 ```
 
 **能发现什么**：Loader 的容错策略是否吞掉了配置错误。
@@ -366,7 +366,7 @@ docker compose logs --since 1m dsh | grep -iE "EADDRINUSE|startup failed|Bot rea
 
 ```bash
 # 1. 把 vipSenders 清空
-docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/qqbot && cp cordis.patch.yml /tmp/bak-yml && python3 -c "
+docker compose exec dsh bash -lc 'cd ~/.dsh/profiles/main && cp cordis.patch.yml /tmp/bak-yml && python3 -c "
 import re
 p=\"cordis.patch.yml\"
 s=open(p).read()
@@ -377,7 +377,7 @@ docker compose restart dsh && sleep 30
 
 # 2. 重点人员不 @ 发一句，看是否还触发
 # 3. 恢复
-docker compose exec dsh bash -lc 'cp /tmp/bak-yml ~/.dsh/profiles/qqbot/cordis.patch.yml'
+docker compose exec dsh bash -lc 'cp /tmp/bak-yml ~/.dsh/profiles/main/cordis.patch.yml'
 docker compose restart dsh
 ```
 
@@ -445,53 +445,6 @@ docker compose exec dsh bash -lc 'zstd -d -c ~/.dsh/sessions/--workspace--/*/*.z
 **判定**：`[Chat history begins]` 与 `[Chat history ends]` 之间的消息行数 **≤ 3**。
 
 **能发现什么**：`historyBuffer({ limit })` 没生效（中间件配置被覆盖）。
-
----
-
-## 五之二、模型降级链（model-fallback 插件）
-
-上游会对**单个模型**做「模型级限流」（code 6004，同凭证其他模型不受影响）。
-只固化一个默认模型时，一被限流每轮请求都直接失败 —— QQ 上就是「她不说话了」。
-
-`image/plugins/model-fallback/` 解决这个：第 0 档用会话选择/默认模型，
-失败就自动换 `DSH_SUBAGENT_MODELS` 表里的下一个，不用人管也不用重启。
-
-### F1. 有限流的模型作默认 → 自动降级并完成任务（核心）
-
-用 `dsh headless` 跑一次性任务，对照两组：
-
-```bash
-# 准备 overlay（默认模型故意填被限流的那个）
-docker cp /tmp/fb-base.yml   dsh:/tmp/fb-base.yml    # provider cpa + agent-default-model=deepseek-v4.1-flash
-docker cp /tmp/fb-plugin.yml dsh:/tmp/fb-plugin.yml  # - insert: model-fallback
-
-# 对照组：不打插件 → 必须失败
-docker compose exec -T dsh bash -lc 'timeout 120 dsh headless --patch /tmp/fb-base.yml "reply with exactly: OK"'
-
-# 实验组：打插件 → 必须成功且日志写出换模型
-docker compose exec -T dsh bash -lc 'timeout 150 dsh headless --patch /tmp/fb-base.yml --patch /tmp/fb-plugin.yml "reply with exactly: OK"'
-```
-
-**判定**：
-
-| 组 | 期望 |
-|---|---|
-| 对照组 | 报 `RATE_LIMIT: 503 ... code 6004` |
-| 实验组 | 输出 `OK`，且出现 `[model-fallback] 首选模型 失败（RATE_LIMIT…）→ 第 2 档换到 cpa/step-5-preview` |
-
-**实测结果（2026-10-26）**：对照组失败、实验组成功，与期望一致。
-
-### F2. 未配回退表时不接管
-
-`DSH_SUBAGENT_MODELS` 留空 → 插件 `return` 前只打一行「未启用」，
-不挂任何监听。
-
-**判定**：行为与不打这个插件完全一致（`agent/request` 透传原配置）。
-
-### F3. 每轮回到第 0 档，不会永久停在兜底模型
-
-**判定**：连续两轮任务，第一轮降级到第 2 档后，第二轮日志仍从
-「首选模型 失败 …」开始，而不是直接用上一轮的兜底模型。
 
 ---
 

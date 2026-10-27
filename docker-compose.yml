@@ -60,12 +60,10 @@ services:
       - DSH_HOME=/home/node/.dsh
       - WORKSPACE=/workspace
 
-      # ── 服务开关（1=开 0=关）──
-      - WEB_ENABLED=${WEB_ENABLED:-1}
-      - QQBOT_ENABLED=${QQBOT_ENABLED:-1}
+      # ── 端口（单一宿主同时提供 Web UI 和 QQ 机器人）──
       - WEB_PORT=8765
       - WEB_FWD_PORT=8766
-      - QQ_PROFILE=${QQ_PROFILE:-qqbot}
+      - MAIN_PROFILE=${MAIN_PROFILE:-main}
 
       # ── 默认工作区 ──
       # DSH 创建默认工作区前会执行 `xdg-user-dir DOCUMENTS` 找目录。
@@ -88,8 +86,10 @@ services:
       - DSH_GROUP_MODE=${DSH_GROUP_MODE:-open}
       # 重点人员 openid（逗号分隔）：没 @ 也会叫醒她看一眼，但不一定回
       - DSH_VIP_SENDERS=${DSH_VIP_SENDERS:-}
-      # 默认模型（新会话没挑过模型时用它）；运行期可用 dsh-model 临时切换
-      # 子智能体模型授权表（顺序 = 回退顺序），格式 provider:model，逗号分隔
+      # 子智能体模型授权表，格式 provider:model，逗号分隔
+      #
+      # ⚠️ 这不是降级链。跨 provider 的自动降级上游没有原生方案；
+      #    默认模型请在 Web 顶部选择器里切换，直接落 agent-default-model。
       - DSH_SUBAGENT_MODELS=${DSH_SUBAGENT_MODELS:-}
       - DSH_SUBAGENT_MAX_DEPTH=${DSH_SUBAGENT_MAX_DEPTH:-3}
       - DSH_SUBAGENT_MAX_PARALLEL=${DSH_SUBAGENT_MAX_PARALLEL:-4}
@@ -114,6 +114,7 @@ services:
       #
       # 改法：DSH_HOME 保持容器内真实目录（可 chmod），只挂需要持久化的子目录。
       # attachments 属于可再生的缓存，留在容器内即可。
+      # 只有一个 profile（main），同时承担 Web 和 QQ 机器人
       - ./data/profiles:/home/node/.dsh/profiles
       - ./data/storages:/home/node/.dsh/storages
       - ./data/sessions:/home/node/.dsh/sessions
@@ -125,6 +126,20 @@ services:
       # 每聊天的模型选择（QQ 插件自己的 prefs，固定在 ~/.dsh-qqbot）。
       # 它在 ~/.dsh 之外，不挂出来的话每次重建容器，各会话挑过的模型全被重置。
       - ./data/qqbot-prefs:/home/node/.dsh-qqbot
+      # 凭据存储（Web 模型页填的 API key 写这里）。
+      #
+      # 不挂出来的话容器一重建 key 就丢，机器人报 MISSING_CREDENTIAL。
+      # 但不能直接挂到 ~/.dsh/.credentials.yaml：DSH 要求这个文件权限 600，
+      # 而 Windows 的 9p 挂载改不了权限（恒为 777），credentials-local 会
+      # 直接拒绝启动：
+      #   is readable beyond its owner (mode 777); run "chmod 600 ..."
+      #
+      # 所以挂到别的路径，由 entrypoint 复制进容器并 chmod 600。
+      - ./data/credentials.yaml:/opt/dsh/state/credentials.yaml
+      # QQ 机器人凭据（扫码产出）。由 credential-guard 写入，entrypoint 读取后
+      # 注入成 QQBOT_APPID/QQBOT_SECRET —— 不留在 cordis.patch.yml 里，
+      # 因为上游 persist.js 会用 yaml.dump 整体覆盖那个文件。
+      - ./data/qqbot-credentials.json:/opt/dsh/state/qqbot-credentials.json
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -167,7 +182,3 @@ services:
 networks:
   dshnet:
     driver: bridge
-
-
-
-

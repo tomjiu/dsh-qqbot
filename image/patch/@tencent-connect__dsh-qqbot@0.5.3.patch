@@ -1,5 +1,5 @@
 diff --git a/dist/config.js b/dist/config.js
-index cc39029c7ec760b13d226818cd88f6a9f61a2c2b..e037a6d9bbdb109b91aa3013ca2988cddd4dba98 100644
+index 8bc513f..8001577 100644
 --- a/dist/config.js
 +++ b/dist/config.js
 @@ -17,6 +17,9 @@ export const ConfigSchema = Schema.object({
@@ -13,7 +13,7 @@ index cc39029c7ec760b13d226818cd88f6a9f61a2c2b..e037a6d9bbdb109b91aa3013ca2988cd
      directPrompt: Schema.string().description('私聊额外system prompt'),
      textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
 diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
-index ca4b0020021c8c434f363c49daa8b265a0300fe7..0ffce25df94be40d7524958a279827615a542a4f 100644
+index ca4b002..0ffce25 100644
 --- a/dist/gateway/middleware-setup.js
 +++ b/dist/gateway/middleware-setup.js
 @@ -37,9 +37,73 @@ export function setupMiddlewares(bot, config, manager, logger) {
@@ -92,12 +92,12 @@ index ca4b0020021c8c434f363c49daa8b265a0300fe7..0ffce25df94be40d7524958a27982761
      // 6. 内容清洗（去 @marker、表情标签、多余空白）
      bot.use(contentSanitizer({
 diff --git a/dist/transport/events.js b/dist/transport/events.js
-index 0daa4115e2c69ea0ab83a2e78aaeec2bfdbf8e49..76b23507a09a1d38d03813c2a9d320a802f5b0df 100644
+index b688eb6..37d437f 100644
 --- a/dist/transport/events.js
 +++ b/dist/transport/events.js
-@@ -41,6 +41,14 @@ export function parseEvent(raw) {
-             const reason = raw.data.reason ?? {};
-             return { type: 'turn/end', reason };
+@@ -60,6 +60,14 @@ export function parseEvent(raw) {
+             }
+             return { type: 'deliverables/presented', turn: data.turn, callId: data.callId, files };
          }
 +        case 'user/message': {
 +            // [PATCH] 暴露本轮消息来源，供出站层区分「真人对话」与「插件内部任务」。
@@ -111,7 +111,7 @@ index 0daa4115e2c69ea0ab83a2e78aaeec2bfdbf8e49..76b23507a09a1d38d03813c2a9d320a8
              return undefined;
      }
 diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
-index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d91ae3fe49 100644
+index 1006265..2dac6a5 100644
 --- a/dist/transport/inbound.js
 +++ b/dist/transport/inbound.js
 @@ -66,6 +66,8 @@ export async function handleInbound(ctx, manager, config, logger) {
@@ -132,10 +132,15 @@ index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d9
      return agentBody;
  }
  /**
-@@ -204,17 +206,27 @@ function renderMediaLine(kind, filename, localPath, url, size) {
- }
+@@ -205,16 +207,29 @@ function renderMediaLine(kind, filename, localPath, url, size) {
  /**
   * Layer 5: 最终 agentBody 拼合
+  */
+-function buildAgentBody(base, history, isGroup, wasMentioned) {
+-    if (!isGroup || !wasMentioned || !history || history.length === 0) {
+-        return base;
++/**
++ * Layer 5: 最终 agentBody 拼合
 + *
 + * [PATCH] 两个改动：
 + *  1. 重点人员触发（vipTrigger，没被 @）也附带群历史 —— 用户要求「看一眼最新 N 条」，
@@ -143,10 +148,7 @@ index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d9
 + *  2. vip 触发时在消息前加一行来源说明，明确「不是直接叫你，可以不回」，
 + *     让她据此自行决定：真要接就正常回，没什么好说的就不输出文本
 + *     （outbound 对空文本会跳过发送，所以「不回」天然成立）。
-  */
--function buildAgentBody(base, history, isGroup, wasMentioned) {
--    if (!isGroup || !wasMentioned || !history || history.length === 0) {
--        return base;
++ */
 +function buildAgentBody(base, history, isGroup, wasMentioned, vipTrigger) {
 +    // 被 @ 或 重点人员触发 → 都带历史；单纯被 @ 的老逻辑保持不变
 +    const includeHistory = isGroup && (wasMentioned || vipTrigger);
@@ -164,7 +166,7 @@ index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d9
          ...historyLines,
          '',
          '[Chat history ends]',
-@@ -222,6 +234,14 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
+@@ -222,6 +237,14 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
          base,
      ].join('\n');
  }
@@ -180,11 +182,11 @@ index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d9
      const results = [];
      if (processed) {
 diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
-index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4306e4852 100644
+index b1a9fcd..9c8d867 100644
 --- a/dist/transport/outbound.js
 +++ b/dist/transport/outbound.js
-@@ -4,12 +4,35 @@ import { formatToolResult } from "./tool-presenter.js";
- import { parseEvent, extractTurnError, } from "./events.js";
+@@ -5,12 +5,35 @@ import { parseEvent, extractTurnError, } from "./events.js";
+ export { parseStreamFrame } from "./events.js";
  /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
  const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
 +/**
@@ -196,13 +198,13 @@ index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4
 + * 配置的分层方式、沙箱权限这个坑…」，像是机器人在自言自语内部日志。
 + *
 + * 判据（关键：不能整轮一刀切）：
-+ *   同一轮里可能既有一条 plugin 消息、又有真人的图片/文字（turn 6/8 就是）。
++ *   同一轮里可能既有一条 plugin 消息、又有真人的图片/文字。
 + *   所以只有「这一轮完全没有真人消息」时才判定为纯内部任务并拦截。
 + *   真人说过话 → 照常发送，不损失任何能力。
 + *
 + * source.kind 实测取值：
 + *   user            ← 真人（QQ 用户发来的）
-+ *   plugin:*        ← 插件内部（meow-memory / speak-up / dsh-proactive 等）
++ *   plugin:*        ← 插件内部（meow-memory / dsh-proactive 等）
 + *   runtime-context ← 系统注入的运行上下文，不算真人发言
 + */
 +const HUMAN_SOURCE_KINDS = new Set(['user', 'human', 'customer']);
@@ -216,12 +218,12 @@ index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4
 +    turnHasHuman = new Map();
 +    /** [PATCH] sessionId → 本轮是否出现过插件内部消息 */
 +    turnHasPlugin = new Map();
-     manager;
-     bot;
-     config;
-@@ -22,6 +45,25 @@ class OutboundRouter {
-         this.logger = logger;
+     /** 每会话当前流式 attemptId：LLM 重试会发布新 attempt，用于 reset 与迟到帧过滤 */
+     streamAttempts = new Map();
+     /** 每会话本轮已声明的交付文件（deliverables/presented，轮末清空） */
+@@ -36,6 +59,25 @@ class OutboundRouter {
          this.toolsRegistry = toolsRegistry;
+         this.deliverer = deliverer;
      }
 +    /** [PATCH] 纯内部任务：本轮有插件消息、但没有任何真人消息 */
 +    isInternalOnlyTurn(sessionId) {
@@ -245,7 +247,7 @@ index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4
      /** 事件分发入口 */
      route(session, raw) {
          const event = parseEvent(raw);
-@@ -31,20 +73,38 @@ class OutboundRouter {
+@@ -45,23 +87,41 @@ class OutboundRouter {
          if (record === undefined)
              return;
          switch (event.type) {
@@ -275,6 +277,9 @@ index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4
 +                    break;
                  this.onToolResult(record, event);
                  break;
+             case 'deliverables/presented':
+                 this.onPresented(session.header.id, event);
+                 break;
              case 'turn/end':
 -                this.onTurnEnd(session.header.id, record, event);
 +                // [PATCH] 纯内部轮次连「本轮异常结束」提示也不发
@@ -285,3 +290,37 @@ index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4
                  break;
          }
      }
+diff --git a/dist/setup/persist.js b/dist/setup/persist.js
+--- a/dist/setup/persist.js
++++ b/dist/setup/persist.js
+@@ -24,6 +24,30 @@ export function persistCredentialsToProfile(credentials, profileDir, logger) {
+         return false;
+     }
+     const patchPath = resolve(dir, 'cordis.patch.yml');
++    // [PATCH] 不写 cordis.patch.yml —— 改存独立文件，然后返回 false。
++    //
++    // 为什么：yaml.dump 全量覆盖会抹掉所有注释、丢掉全部 `- insert:` 条目
++    // （worldbook / log-console 都在里面），并把 schema
++    // 补全值固化进文件。写完还要等 HMR 重载新 fiber 才能启动网关，
++    // 而那时插件树已经残缺。
++    //
++    // 返回 false 会让 index.js 走降级分支：
++    //   logger.warn('凭据未能持久化，本次进程将使用环境变量凭据启动')
++    //   void bootstrapGateway(ctx, agents, {...config, appId, appSecret}, logger)
++    // 也就是**扫码后立即启动网关，不需要 HMR、不需要重启**。
++    //
++    // 持久化由我们接管：凭据写进 QQBOT_CRED_FILE，entrypoint 下次启动
++    // 读它注入 QQBOT_APPID / QQBOT_SECRET。
++    try {
++        const credFile = process.env.QQBOT_CRED_FILE || '/opt/dsh/state/qqbot-credentials.json';
++        mkdirSync(resolve(credFile, '..'), { recursive: true });
++        writeFileSync(credFile, JSON.stringify({ appId: credentials.appId, appSecret: credentials.appSecret, savedAt: new Date().toISOString() }, null, 2) + '\n', 'utf8');
++        log.info(`✔ 凭据已保存到 ${credFile}（不写 cordis.patch.yml，避免覆盖 profile 配置）`);
++        log.info('  本次启动直接使用该凭据，无需重启');
++    } catch (error) {
++        log.warn(`保存凭据到独立文件失败: ${error instanceof Error ? error.message : String(error)}`);
++    }
++    return false;
+     try {
+         // 1. 解析现有条目（文件不存在/为空才重建；解析失败会抛错，保留原文件）
+         let entries = [];
