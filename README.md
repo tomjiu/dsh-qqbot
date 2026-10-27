@@ -12,6 +12,9 @@
 - **主动说话**：`dsh-proactive` 宿主级定时唤醒（能唤醒冷会话）
 - **干活**：容器里 python / node / git / gcc 齐全，沙箱放开，AI 能真正操作
 
+**镜像**：`mingjiu/dsh-qqbot:latest`（[Docker Hub](https://hub.docker.com/r/mingjiu/dsh-qqbot)）
+**源码**：[github.com/tomjiu/dsh-qqbot](https://github.com/tomjiu/dsh-qqbot)
+
 ---
 
 ## 快速开始
@@ -19,14 +22,21 @@
 ### 方式一：docker compose（推荐）
 
 ```bash
+git clone https://github.com/tomjiu/dsh-qqbot.git
+cd dsh-qqbot
+
 cp .env.example .env
 # .env 里**只需要** QQ 凭据，两种都可以：
 #   A. 留空 —— 启动后在 Web 里扫码
 #   B. 填 QQBOT_APPID / QQBOT_SECRET
 
-docker compose up -d --build
+docker compose up -d      # 直接拉预构建镜像，秒级
 docker compose logs -f dsh
 ```
+
+> 镜像在 Docker Hub：https://hub.docker.com/r/mingjiu/dsh-qqbot
+> 标签：`latest` / `0.1.0`。
+> 想自己从源码构建就加 `--build`（约 10-15 分钟，装系统依赖比较慢）。
 
 ### 方式二：直接 docker run
 
@@ -48,7 +58,7 @@ docker run -d --name dsh \
   -v $PWD/data/qqbot-prefs:/home/node/.dsh-qqbot \
   -v $PWD/data/credentials.yaml:/opt/dsh/state/credentials.yaml \
   -v $PWD/data/qqbot-credentials.json:/opt/dsh/state/qqbot-credentials.json \
-  dsh-qqbot:latest
+  mingjiu/dsh-qqbot:latest
 ```
 
 ### 启动后

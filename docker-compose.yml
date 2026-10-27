@@ -33,7 +33,10 @@ services:
         UID: ${DSH_UID:-1000}
         GID: ${DSH_GID:-1000}
         DSH_VERSION: ${DSH_VERSION:-0.2.1-rc.2}
-    image: dsh-qqbot:${DSH_TAG:-latest}
+    # 默认用 Docker Hub 上预构建好的镜像，别人拿到直接 pull（秒级）。
+    # 想自己构建：docker compose build（约 10-15 分钟），或把下面改成
+    #   image: dsh-qqbot:${DSH_TAG:-latest}
+    image: ${DSH_IMAGE:-mingjiu/dsh-qqbot}:${DSH_TAG:-latest}
     container_name: ${DSH_CONTAINER_NAME:-dsh}
     # 启动失败时最多重试 5 次就停下（而不是无限重启刷爆日志）。
     # 进程意外崩溃时 on-failure 仍会拉起 —— 配合 entrypoint 的 wait -n。
