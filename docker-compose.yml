@@ -1,0 +1,173 @@
+# ════════════════════════════════════════════════════════════════════════
+#  DSH + QQ Bot
+#
+#  架构
+#  ─────────────────────────────────────────────────────────────────────
+#    QQ 用户 ──→ DeepSeek 官方 QQ Bot 网关（API v2，出站 WebSocket）
+#                        │
+#                        ▼
+#                 ┌─────────────────────────────┐
+#                 │  dsh 容器                    │
+#                 │  ├─ dsh web   :8765（回环）  │
+#                 │  ├─ socat       :8766（映射）│
+#                 │  ├─ dsh --profile qqbot      │
+#                 │  ├─ /workspace ← 你的代码    │
+#                 │  └─ python/node/git/gcc      │
+#                 └─────────────────────────────┘
+#
+#  快速开始
+#  ─────────────────────────────────────────────────────────────────────
+#    cp .env.example .env      # 填 QQ 凭据 + 模型 key
+#    docker compose up -d --build
+#    docker compose logs -f    # 看启动横幅、Web 地址、扫码二维码
+#
+#  看 Web 地址：docker compose logs dsh | grep "Web UI"
+#  重新扫码：  docker compose exec dsh dsh-relogin
+# ════════════════════════════════════════════════════════════════════════
+services:
+  dsh:
+    build:
+      context: .                    # ← 根目录，Dockerfile 在根上
+      dockerfile: Dockerfile
+      args:
+        UID: ${DSH_UID:-1000}
+        GID: ${DSH_GID:-1000}
+        DSH_VERSION: ${DSH_VERSION:-0.2.1-rc.2}
+    image: dsh-qqbot:${DSH_TAG:-latest}
+    container_name: ${DSH_CONTAINER_NAME:-dsh}
+    # 启动失败时最多重试 5 次就停下（而不是无限重启刷爆日志）。
+    # 进程意外崩溃时 on-failure 仍会拉起 —— 配合 entrypoint 的 wait -n。
+    # 想无限重试就改成 unless-stopped。
+    restart: "on-failure:5"
+    # tini 需要真正的 init 语义；interactive 便于 docker attach 看扫码
+    stdin_open: true
+    tty: true
+    init: false                     # Dockerfile 里已用 tini 作为 ENTRYPOINT
+
+    working_dir: /workspace
+
+    # ── 资源限制：容器是隔离边界 ──────────────────────────────────
+    cpus: "${DSH_CPUS:-3.0}"
+    mem_limit: ${DSH_MEM:-4g}
+    memswap_limit: ${DSH_MEM:-4g}
+    pids_limit: 2048
+
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - LANG=C.UTF-8
+
+      # ── 路径 ──
+      - DSH_HOME=/home/node/.dsh
+      - WORKSPACE=/workspace
+
+      # ── 服务开关（1=开 0=关）──
+      - WEB_ENABLED=${WEB_ENABLED:-1}
+      - QQBOT_ENABLED=${QQBOT_ENABLED:-1}
+      - WEB_PORT=8765
+      - WEB_FWD_PORT=8766
+      - QQ_PROFILE=${QQ_PROFILE:-qqbot}
+
+      # ── 默认工作区 ──
+      # DSH 创建默认工作区前会执行 `xdg-user-dir DOCUMENTS` 找目录。
+      # 容器里没法靠桌面环境推断，直接指定：默认工作区会落在
+      #   /workspace/deepseek-harness/default-workspace
+      - XDG_DOCUMENTS_DIR=/workspace
+
+      # ── 权限：容器内放任，由容器边界提供隔离 ──
+      - DSH_PERMISSION_MODE=${DSH_PERMISSION_MODE:-danger-full-access}
+
+      # ── 模型服务商凭据（profile 模板里用 apiKeyEnv 引用）──
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+
+      # ── QQ Bot 凭据（留空则启动时自动进入扫码引导）──
+      - QQBOT_APPID=${QQBOT_APPID:-}
+      - QQBOT_SECRET=${QQBOT_SECRET:-}
+      - QQBOT_BIND_OPEN_BROWSER=0
+      # groupAllow 由 entrypoint 渲染进 profile，多个群用逗号分隔
+      - DSH_GROUP_ALLOW=${DSH_GROUP_ALLOW:-}
+      - DSH_GROUP_MODE=${DSH_GROUP_MODE:-open}
+      # 重点人员 openid（逗号分隔）：没 @ 也会叫醒她看一眼，但不一定回
+      - DSH_VIP_SENDERS=${DSH_VIP_SENDERS:-}
+      # 默认模型（新会话没挑过模型时用它）；运行期可用 dsh-model 临时切换
+      # 子智能体模型授权表（顺序 = 回退顺序），格式 provider:model，逗号分隔
+      - DSH_SUBAGENT_MODELS=${DSH_SUBAGENT_MODELS:-}
+      - DSH_SUBAGENT_MAX_DEPTH=${DSH_SUBAGENT_MAX_DEPTH:-3}
+      - DSH_SUBAGENT_MAX_PARALLEL=${DSH_SUBAGENT_MAX_PARALLEL:-4}
+
+      # ── 网络 ──
+      - NPM_CONFIG_REGISTRY=https://registry.npmmirror.com
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-localhost,127.0.0.1,host.docker.internal}
+
+    volumes:
+      # 代码工作区：宿主机改，容器立即可见，反之亦然
+      - ./workspace:/workspace
+
+      # ⚠️ 不要直接挂整个 ./dsh/home:/home/node/.dsh
+      #
+      # Docker Desktop 在 Windows 上用 9p 协议挂载，挂载点本身无法 chmod：
+      #   chmod: changing permissions of '/home/node/.dsh': Operation not permitted
+      # 而 @deepseek-ai/dsh-attachment-local 的 ensureDurableDirectory()
+      # 需要把 DSH_HOME/attachments/v1 及其上级目录 chmod 成 700，
+      # 于是 qqbot_describe_image 每次都在读图之前炸 EPERM，机器人看不到图片。
+      #
+      # 改法：DSH_HOME 保持容器内真实目录（可 chmod），只挂需要持久化的子目录。
+      # attachments 属于可再生的缓存，留在容器内即可。
+      - ./data/profiles:/home/node/.dsh/profiles
+      - ./data/storages:/home/node/.dsh/storages
+      - ./data/sessions:/home/node/.dsh/sessions
+      - ./data/proactive:/home/node/.dsh/proactive
+      # 信任工作区标记（meow-memory 用）：不挂出来的话每次重建容器都会丢，
+      # 记忆库又会被当成「外部预置库」暂停，并在每个新会话里注入一条提示
+      # 让她去改配置 —— QQ 上表现为「发个问号，她在折腾配置文件」。
+      - ./data/trusted-workspaces:/home/node/.dsh/trusted-workspaces
+      # 每聊天的模型选择（QQ 插件自己的 prefs，固定在 ~/.dsh-qqbot）。
+      # 它在 ~/.dsh 之外，不挂出来的话每次重建容器，各会话挑过的模型全被重置。
+      - ./data/qqbot-prefs:/home/node/.dsh-qqbot
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Web UI 端口映射
+    #
+    # dsh web 不允许绑 0.0.0.0（会直接退出，理由是暴露 RCE），这个限制不绕过。
+    # 做法：web 绑容器内 127.0.0.1:8765 → socat 转到 0.0.0.0:8766
+    #      → Docker 映射到【宿主机 127.0.0.1:8766】。
+    # 冒号前写 127.0.0.1，只有本机能访问，局域网/公网都碰不到。
+    ports:
+      # 只暴露 8766。
+      #
+      # dsh web 拒绝绑定 0.0.0.0（怕把 RCE 暴露到网络），所以它只监听
+      # 容器内 127.0.0.1:8765，由 socat 转发到 0.0.0.0:8766 再映射出来。
+      # 8765 是内部实现细节，映射出去只会让人点错链接。
+      - "127.0.0.1:${WEB_HOST_PORT:-8766}:8766"
+
+    networks:
+      - dshnet
+
+    # ── 健康检查：web 没起来就标记 unhealthy ──
+    # 判定「端口在监听」而不是「HTTP 200」：web 需要 token，
+    # 无凭据访问会返回 401 —— 那是服务健康的证据，不是故障。
+    # 8766 = socat 转发（外部可达），8765 = node 直连（仅容器内部）。
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null --max-time 5 http://127.0.0.1:8766/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+    # ── 日志轮转 ──
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+networks:
+  dshnet:
+    driver: bridge
+
+
+
+

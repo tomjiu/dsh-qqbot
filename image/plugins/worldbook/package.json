@@ -1,0 +1,13 @@
+{
+  "name": "dsh-worldbook-engine",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js"
+  },
+  "description": "World book engine for a dsh agent preset: constant prompt section plus keyword-triggered pre-step injection, with the worldbook read/write tool.",
+  "license": "MIT"
+}
+

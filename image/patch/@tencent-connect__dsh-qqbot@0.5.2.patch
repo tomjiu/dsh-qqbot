@@ -1,0 +1,287 @@
+diff --git a/dist/config.js b/dist/config.js
+index cc39029c7ec760b13d226818cd88f6a9f61a2c2b..e037a6d9bbdb109b91aa3013ca2988cddd4dba98 100644
+--- a/dist/config.js
++++ b/dist/config.js
+@@ -17,6 +17,9 @@ export const ConfigSchema = Schema.object({
+     preset: Schema.string().description('Agent preset id'),
+     cwd: Schema.string().description('Agent working directory'),
+     requireMention: Schema.boolean().default(true).description('群聊是否需要@bot触发'),
++    // [PATCH] 重点人员：这些人发言时不用 @ 也会被回复（隐性 @）。
++    // 填 QQ openid（不是 QQ 号）。留空则退化为 c2cAllow。
++    vipSenders: Schema.array(Schema.string()).default([]).description('群聊重点人员 openid：发话即响应，无需 @'),
+     groupPrompt: Schema.string().description('群聊额外system prompt'),
+     directPrompt: Schema.string().description('私聊额外system prompt'),
+     textChunkLimit: Schema.number().default(4500).description('单条消息最大字符数'),
+diff --git a/dist/gateway/middleware-setup.js b/dist/gateway/middleware-setup.js
+index ca4b0020021c8c434f363c49daa8b265a0300fe7..0ffce25df94be40d7524958a279827615a542a4f 100644
+--- a/dist/gateway/middleware-setup.js
++++ b/dist/gateway/middleware-setup.js
+@@ -37,9 +37,73 @@ export function setupMiddlewares(bot, config, manager, logger) {
+             return historyGroupKey(config.appId, gid);
+         },
+     }));
+-    // 5. 群聊 @bot 门控
++    // 5. 群聊触发策略
++    //
++    // [PATCH] 三档策略（用户需求）：
++    //   a) 被 @                       → 触发，且模型「应当回」
++    //   b) 重点人员（vipSenders）发话   → 触发，但模型「可以不回」
++    //                                    只是把消息推到她眼前，让她自己判断接不接。
++    //   c) 其他人在闲聊               → 不触发模型（消息已进历史缓冲，
++    //                                    下次 a/b 触发时模型看得到这段上下文）
++    //
++    // 为什么用 isImplicitMention 而不是 requireMention=false：
++    //   requireMention=false 会让每条群消息都开一轮模型，活跃群一天能烧几十块。
++    //   精确放行 + 其余静默进缓冲，既有上下文又不烧钱。
++    //
++    // ⚠️ 重点人员不是「必回」，是「一定看得到 + 由她决定回不回」。
++    //   实现上：vip 消息放行给模型，并在 envelope 里标 note（见 inbound 补丁），
++    //   让她知道这不是直接叫她；同时 groupPrompt 里写明「可以不回」。
++    //   模型若决定不回，只需不输出文本（outbound 对空文本会跳过发送）。
++    //
++    // 重点人员名单来自 config.vipSenders（QQ openid 数组）。
++    const vipSenders = new Set(
++        Array.isArray(config.vipSenders) && config.vipSenders.length > 0
++            ? config.vipSenders
++            : (Array.isArray(config.access?.c2cAllow) ? config.access.c2cAllow : []),
++    );
++    // mentionGate 内部判定「是否被 @」的三条路径。回调里必须自己复刻一遍：
++    // 它无条件调用 isImplicitMention，且 wasMentioned 只是它函数内的局部变量，
++    // 调用前不会写进 ctx.state.mention，所以回调读不到。
++    const isMentioned = (ctx) => {
++        const msg = ctx.message;
++        if (msg.rawEventType === 'GROUP_AT_MESSAGE_CREATE')
++            return true;
++        if (Array.isArray(msg.mentions) && msg.mentions.some((m) => m?.is_you === true))
++            return true;
++        const appId = ctx.bot?.appId ?? config.appId;
++        if (msg.content && appId) {
++            const re = new RegExp(`<@!?${String(appId).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}>`);
++            if (re.test(msg.content))
++                return true;
++        }
++        return false;
++    };
+     bot.use(mentionGate({
+         requireMentionInGroup: config.requireMention,
++        // 「隐性 @」：重点人员哪怕没 @ 也放行到模型（不代表必须回）
++        isImplicitMention: (ctx) => {
++            if (ctx.message.kind !== 'group')
++                return false;
++            const sid = ctx.message.senderId;
++            if (!sid || !vipSenders.has(sid))
++                return false;
++            // ⚠️ 先判是否已经被 @ —— 被 @ 就走 @ 分支，不能标成 vip 触发。
++            //    否则 inbound 会给她的消息加上
++            //    「[Note] 这条是重点人员刚发的消息（没有 @ 你）」，语义正好相反。
++            if (isMentioned(ctx))
++                return false;
++            // 标一个独立标记，供后续中间件/inbound 区分「真 @」和「重点人员触发」
++            ctx.state.vipTrigger = true;
++            if (config.debug) {
++                logger.debug(`[trigger] vip sender ${sid} -> surface to model (reply optional)`);
++            }
++            return true;
++        },
++        onSkip: (_ctx, decision) => {
++            if (config.debug) {
++                logger.debug(`[trigger] skip group msg (${decision.reason})`);
++            }
++        },
+     }));
+     // 6. 内容清洗（去 @marker、表情标签、多余空白）
+     bot.use(contentSanitizer({
+diff --git a/dist/transport/events.js b/dist/transport/events.js
+index 0daa4115e2c69ea0ab83a2e78aaeec2bfdbf8e49..76b23507a09a1d38d03813c2a9d320a802f5b0df 100644
+--- a/dist/transport/events.js
++++ b/dist/transport/events.js
+@@ -41,6 +41,14 @@ export function parseEvent(raw) {
+             const reason = raw.data.reason ?? {};
+             return { type: 'turn/end', reason };
+         }
++        case 'user/message': {
++            // [PATCH] 暴露本轮消息来源，供出站层区分「真人对话」与「插件内部任务」。
++            const source = raw.data?.message?.source ?? raw.data?.source ?? {};
++            return {
++                type: 'user/message',
++                sourceKind: typeof source.kind === 'string' ? source.kind : '',
++            };
++        }
+         default:
+             return undefined;
+     }
+diff --git a/dist/transport/inbound.js b/dist/transport/inbound.js
+index 100626532ae52303f6f54af19a52600d98a7425f..fe58a19540d6d7d50a232811db3c60d91ae3fe49 100644
+--- a/dist/transport/inbound.js
++++ b/dist/transport/inbound.js
+@@ -66,6 +66,8 @@ export async function handleInbound(ctx, manager, config, logger) {
+ function assembleAgentBody(msg, state, scope, logger) {
+     const isGroup = scope === 'group';
+     const wasMentioned = state.mention?.wasMentioned ?? false;
++    // [PATCH] 重点人员触发标记（mentionGate 的 isImplicitMention 里打的）
++    const vipTrigger = state.vipTrigger === true;
+     const userContent = buildUserContent(msg, state, logger);
+     if (isEmptyMessage(userContent, msg.attachments, isGroup, wasMentioned))
+         return null;
+@@ -73,7 +75,7 @@ function assembleAgentBody(msg, state, scope, logger) {
+     const userMessage = buildUserMessage(userContent, quotePart, msg.senderId, msg.senderName, isGroup, wasMentioned);
+     const dynamicCtx = buildDynamicCtx(msg, state);
+     const base = dynamicCtx ? `${dynamicCtx}${userMessage}` : userMessage;
+-    const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned);
++    const agentBody = buildAgentBody(base, state.history, isGroup, wasMentioned, vipTrigger);
+     return agentBody;
+ }
+ /**
+@@ -204,17 +206,27 @@ function renderMediaLine(kind, filename, localPath, url, size) {
+ }
+ /**
+  * Layer 5: 最终 agentBody 拼合
++ *
++ * [PATCH] 两个改动：
++ *  1. 重点人员触发（vipTrigger，没被 @）也附带群历史 —— 用户要求「看一眼最新 N 条」，
++ *     否则她只看到孤零零一句，没有上下文可判断要不要接。
++ *  2. vip 触发时在消息前加一行来源说明，明确「不是直接叫你，可以不回」，
++ *     让她据此自行决定：真要接就正常回，没什么好说的就不输出文本
++ *     （outbound 对空文本会跳过发送，所以「不回」天然成立）。
+  */
+-function buildAgentBody(base, history, isGroup, wasMentioned) {
+-    if (!isGroup || !wasMentioned || !history || history.length === 0) {
+-        return base;
++function buildAgentBody(base, history, isGroup, wasMentioned, vipTrigger) {
++    // 被 @ 或 重点人员触发 → 都带历史；单纯被 @ 的老逻辑保持不变
++    const includeHistory = isGroup && (wasMentioned || vipTrigger);
++    if (!includeHistory || !history || history.length === 0) {
++        return vipTrigger && !wasMentioned ? `${vipSourceNote()}${base}` : base;
+     }
+     const historyLines = history.map(h => {
+         const name = h.senderName ?? shortSenderId(h.senderId);
+         return `[${name} (${h.senderId})] ${h.content}`;
+     });
++    const prefix = vipTrigger && !wasMentioned ? vipSourceNote() : '';
+     return [
+-        '[Chat history begins]',
++        `${prefix}[Chat history begins]`,
+         ...historyLines,
+         '',
+         '[Chat history ends]',
+@@ -222,6 +234,14 @@ function buildAgentBody(base, history, isGroup, wasMentioned) {
+         base,
+     ].join('\n');
+ }
++/** [PATCH] 重点人员触发时告诉模型的来源说明（不是硬性要求回复） */
++function vipSourceNote() {
++    return [
++        '[Note] 这条是重点人员刚发的消息（没有 @ 你）。你被叫起来看一眼群里在聊什么。',
++        '      想接就接，不想接就别输出任何文字，安静待着即可 —— 不回也没关系。',
++        '',
++    ].join('\n');
++}
+ function extractVoiceTexts(attachments, processed, _logger) {
+     const results = [];
+     if (processed) {
+diff --git a/dist/transport/outbound.js b/dist/transport/outbound.js
+index f50e4b27e8c9cf862983f26ebade8fcee08947fd..49014be4ddf555fe72311f3b5289b2a4306e4852 100644
+--- a/dist/transport/outbound.js
++++ b/dist/transport/outbound.js
+@@ -4,12 +4,35 @@ import { formatToolResult } from "./tool-presenter.js";
+ import { parseEvent, extractTurnError, } from "./events.js";
+ /** 不展示给用户的轮次错误码（底层传输/网络错误，对用户无意义，且常被重试兜住） */
+ const SILENT_TURN_ERROR_CODES = new Set(['STREAM_CLOSED']);
++/**
++ * [PATCH] 内部任务拦截层
++ *
++ * 问题：有些插件会往会话里塞一条 user/message 触发整轮（meow-memory 的
++ * 「记忆反思」「外部记忆库提示」「首次设置」等）。模型照常产出回复，本路由
++ * 再无条件发到 QQ —— 用户看到的是「记好了，本鱼这次确实动了脑子：profile
++ * 配置的分层方式、沙箱权限这个坑…」，像是机器人在自言自语内部日志。
++ *
++ * 判据（关键：不能整轮一刀切）：
++ *   同一轮里可能既有一条 plugin 消息、又有真人的图片/文字（turn 6/8 就是）。
++ *   所以只有「这一轮完全没有真人消息」时才判定为纯内部任务并拦截。
++ *   真人说过话 → 照常发送，不损失任何能力。
++ *
++ * source.kind 实测取值：
++ *   user            ← 真人（QQ 用户发来的）
++ *   plugin:*        ← 插件内部（meow-memory / speak-up / dsh-proactive 等）
++ *   runtime-context ← 系统注入的运行上下文，不算真人发言
++ */
++const HUMAN_SOURCE_KINDS = new Set(['user', 'human', 'customer']);
+ /**
+  * 出站路由器：持有会话级状态，按事件类型分发到处理器
+  */
+ class OutboundRouter {
+     buffers = new Map();
+     toolCalls = new Map();
++    /** [PATCH] sessionId → 本轮是否出现过真人消息 */
++    turnHasHuman = new Map();
++    /** [PATCH] sessionId → 本轮是否出现过插件内部消息 */
++    turnHasPlugin = new Map();
+     manager;
+     bot;
+     config;
+@@ -22,6 +45,25 @@ class OutboundRouter {
+         this.logger = logger;
+         this.toolsRegistry = toolsRegistry;
+     }
++    /** [PATCH] 纯内部任务：本轮有插件消息、但没有任何真人消息 */
++    isInternalOnlyTurn(sessionId) {
++        return this.turnHasPlugin.get(sessionId) === true
++            && this.turnHasHuman.get(sessionId) !== true;
++    }
++    /** [PATCH] 记录本轮消息来源 */
++    markTurnSource(sessionId, kind) {
++        if (HUMAN_SOURCE_KINDS.has(kind)) {
++            this.turnHasHuman.set(sessionId, true);
++        }
++        else if (kind.startsWith('plugin:')) {
++            this.turnHasPlugin.set(sessionId, true);
++        }
++    }
++    /** [PATCH] 清理本轮状态 */
++    clearTurnSource(sessionId) {
++        this.turnHasHuman.delete(sessionId);
++        this.turnHasPlugin.delete(sessionId);
++    }
+     /** 事件分发入口 */
+     route(session, raw) {
+         const event = parseEvent(raw);
+@@ -31,20 +73,38 @@ class OutboundRouter {
+         if (record === undefined)
+             return;
+         switch (event.type) {
++            case 'user/message':
++                // [PATCH] 只记录，不发送
++                this.markTurnSource(session.header.id, event.sourceKind);
++                break;
+             case 'assistant/chunk':
++                if (this.isInternalOnlyTurn(session.header.id))
++                    break;
+                 this.onChunk(session.header.id, record, event);
+                 break;
+             case 'assistant/message':
++                if (this.isInternalOnlyTurn(session.header.id)) {
++                    this.logger.debug?.(`im-qqbot: skip internal-only turn`);
++                    break;
++                }
+                 this.onMessage(session.header.id, record, event);
+                 break;
+             case 'tool/call':
++                if (this.isInternalOnlyTurn(session.header.id))
++                    break;
+                 this.onToolCall(event);
+                 break;
+             case 'tool/result':
++                if (this.isInternalOnlyTurn(session.header.id))
++                    break;
+                 this.onToolResult(record, event);
+                 break;
+             case 'turn/end':
+-                this.onTurnEnd(session.header.id, record, event);
++                // [PATCH] 纯内部轮次连「本轮异常结束」提示也不发
++                if (!this.isInternalOnlyTurn(session.header.id)) {
++                    this.onTurnEnd(session.header.id, record, event);
++                }
++                this.clearTurnSource(session.header.id);
+                 break;
+         }
+     }

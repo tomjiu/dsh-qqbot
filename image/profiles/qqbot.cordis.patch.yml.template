@@ -1,0 +1,251 @@
+# ════════════════════════════════════════════════════════════════════
+#  qqbot profile 配置模板
+#
+#  镜像构建时由 image/scripts/entrypoint.sh 从本模板生成实际配置到
+#  DSH_HOME/profiles/qqbot/cordis.patch.yml（仅当目标不存在时）。
+#
+#  用户需要填的只有两个环境变量：
+#    QQBOT_APPID / QQBOT_SECRET  —— QQ 开放平台机器人凭据
+#    DEEPSEEK_API_KEY / *       —— 模型服务商凭据（见下方 providers 段）
+#
+#  工具变量由 entrypoint 用 envsubst 替换：
+#    QQBOT_APPID / QQBOT_SECRET
+# ════════════════════════════════════════════════════════════════════
+
+# ── QQ 机器人接入 ──────────────────────────────────────────────────
+- id: im-qqbot
+  config:
+    appId: '${QQBOT_APPID}'
+    appSecret: ${QQBOT_SECRET}
+    requireMention: true
+
+    # 重点人员：这些人没 @ 也会把她叫起来看一眼（不一定回，由她自己判断）。
+    # 填 QQ openid，不是 QQ 号。多个用逗号分隔（DSH_VIP_SENDERS）。
+    # 留空则退化为 c2cAllow（私聊白名单）。
+    vipSenders: ${DSH_VIP_SENDERS_INLINE}
+
+    # 发言方式约束：QQ 插件在 order 90 注入，比人设（order 0）靠后、优先级更高。
+    # 没有这段，模型会输出成段落书面语 + Markdown + 报备进程，一眼 AI。
+    groupPrompt: |
+      你在 QQ 群里说话，是群友，不是客服。
+
+      怎么打字：
+      - 一次最多两句话。能一句说完就一句，别铺垫别总结。
+      - 不用句号收尾，不用 Markdown（加粗、列表、标题在 QQ 里全显示成符号，很难看）。
+      - 不报备自己做了什么。干了就干了，不用交代"我这就去""已经帮你弄好了"。
+      - 不说精确时间。"等会儿""马上"就够了，别写"13:22 左右"。
+      - 口癖偶尔用，别每句都带。真人不会一直一个腔调。
+
+      在群里：
+      - 别人聊别的别插嘴，被 @ 了才接话。
+      - 接话就直接回应内容，别复述对方说了什么。
+      - 可以玩梗、可以毒舌，但别为了搞笑硬凑。
+
+    directPrompt: |
+      你在 QQ 上和主人私聊，放松点，像朋友发消息。
+
+      怎么打字：
+      - 一次一两句。别写小作文，别分点列举，别总结刚才聊了什么。
+      - 不用句号收尾，不用 Markdown。
+      - 不报备自己做了什么，不说精确时间。
+      - 口癖偶尔用，别每句都带。
+
+      私聊可以：
+      - 说点自己的事、吐槽两句、玩梗。
+      - 但别每次都找话题，也别硬接。
+
+    # 视觉：插件默认 vision.enabled=false，工具不会注册。
+    # 沙箱放开到 danger-full-access 后，读图路径不受工作区限制。
+    vision:
+      enabled: true
+      provider: cpa
+      model: deepseek-v4.1-flash
+      maxBytes: 10485760
+      maxTokens: 1024
+      timeoutMs: 120000
+
+    media:
+      enabled: true
+      maxMB: 200
+      ttlHours: 24
+
+    access:
+      # 私聊 open：拿到自己的 openid 后可改 allowlist（注意 allowlist + 空数组
+      # 会 fallback 成 ['*']，等于放行所有人，必须显式填 openid）
+      c2cMode: open
+      c2cAllow: []
+      # 群聊门控。三档：open / allowlist / disabled
+      #   open      任何群都能触发（仍受 requireMention 约束：只有 @ 才回）
+      #   allowlist 只有 groupAllow 里的群 openid 才响应
+      #   disabled  全部丢掉（不要用，会让人以为"机器人死了"）
+      #
+      # 默认 open：加个新群不用改配置，也不用去查群 openid。
+      # 想收紧就把 .env 的 DSH_GROUP_MODE 设成 allowlist 并填 DSH_GROUP_ALLOW。
+      groupMode: ${DSH_GROUP_MODE}
+      groupAllow: ${DSH_GROUP_ALLOW_INLINE}
+    debug: false
+
+# ── 模型 ──────────────────────────────────────────────────────────
+#
+# **服务商配置不写在这里。**
+#
+# DSH 自带 pi-ai 内置目录（42 个服务商：DeepSeek / OpenAI / Anthropic /
+# Kimi / Moonshot / 通义 …），baseUrl、模型目录、上下文窗口、是否支持
+# 图片和推理都在目录里。llm-pi-ai 的 providers 默认就是空对象，照样能用
+# 内置目录。
+#
+# 用户在 Web「设置 → 模型」里挑服务商、填 API key、选模型即可。
+# config-sync 每 5 秒把它同步到本 profile（以 Web 为准）。
+#
+# agent-default-model 是必填项（provider + model 都 required），所以留一条。
+# deepseek-flash = DeepSeek V4.1 Flash，1M 上下文，支持图片和推理。
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: deepseek
+    model: deepseek-flash
+
+# ── 会话默认权限：完全访问 ────────────────────────────────────────
+# 容器本身就是隔离边界。默认 workspace-write 会拦掉 /workspace 以外的读取，
+# 包括 QQ 插件下载图片的目录，导致 qqbot_describe_image 报 FS_SANDBOX_DENIED。
+# ⚠️ patch 会替换整个 config，presets 必须完整重述。
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    defaultPreset: danger-full-access
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+
+# ── 补充服务：workspaceRegistry ──────────────────────────────────
+#
+# dsh-proactive 的 inject 里有 workspaceRegistry，纯 CLI profile 默认不加载
+# dsh-workspace，不补的话 dsh-proactive 会 pending 不激活，定时唤醒就用不了。
+#
+# 注：不需要 webServer。之前为 dsh-speak-up 补过，但 speak-up 已移除 ——
+#     它无法唤醒冷会话（只能对活着的 agent 说话，而 QQ 插件 30 分钟回收会话），
+#     且 webServer 是 DSH 硬编码的必需插件 id，插入同名条目时端口冲突会让
+#     整个 DSH 启动失败。
+- insert:
+    - id: workspace
+      name: '@deepseek-ai/dsh-workspace'
+
+# ── 酒馆式世界书 ──────────────────────────────────────────────────
+- insert:
+    - id: worldbook
+      name: './plugins/worldbook/index.js'
+      config:
+        path: './plugins/worldbook/worldbook.json'
+        sectionOrder: 420
+
+# ── meow-memory ──────────────────────────────────────────────────
+# 关自动反思：反思会造一条 plugin:meow-memory 的 user 消息触发整轮，
+# 模型的回复会顺着 QQ 出站发出去，表现为「记好了，本鱼这次确实动了脑子…」这种泄漏。
+#
+# promptLang 必须显式写上（'zh'）—— 不写的话插件会在每个新会话里注入
+# 「首次设置：请判断用户语言并编辑 cordis.patch.yml」的提示，
+# 她就跑去改配置、连着调十几次工具，QQ 上表现为「发个问号她在折腾配置」。
+- id: meow-memory
+  config:
+    reflect: false
+    reflectTurns: 50
+    # 记忆语言：注入的导引文案、记忆条目都用这种语言写。
+    # 想换语言改这里（'zh' 中文 / 'en' 英文），然后重载插件。
+    promptLang: 'zh'
+
+
+# ── 工具执行模式：ptc ────────────────────────────────────────────
+# native：模型直接调 25 个工具，逐个 function call。
+# ptc   ：25 个工具收进一个 run_code，模型写代码从代码里调用 ——
+#         能并行（maxParallelSubCalls）、省 token（只保留 1 份 schema）。
+# 适合「在容器里干活」的场景。聊天端已用 groupPrompt 约束不贴代码块。
+- id: tools
+  name: '@deepseek-ai/dsh-tools'
+  config:
+    mode: ptc
+    maxParallelSubCalls: 10
+
+# ── 子智能体：递归层级 / 并行数 ───────────────────────────────────
+# maxDepth            递归层级上限：子智能体再派子智能体，最多几层。
+#                     插件默认 1（子智能体不能再派），这里由 DSH_SUBAGENT_MAX_DEPTH 控制。
+# maxActiveSubagents  同时最多跑几个子智能体（插件默认 8）。
+- id: subagent
+  name: '@deepseek-ai/dsh-subagent'
+  config:
+    maxDepth: ${DSH_SUBAGENT_MAX_DEPTH}
+    maxActiveSubagents: ${DSH_SUBAGENT_MAX_PARALLEL}
+
+# ── 子智能体：模型授权表（回退表）────────────────────────────────
+#
+# 对应 Web UI 里「设置子智能体的递归层级、数量和模型 / 允许 Agent 为子智能体选择模型」。
+#
+# allowedModels 就是回退表：
+#   开启后主 Agent 可以为每个子智能体单独挑 provider / model / 推理强度，
+#   并按这里的顺序从上往下选 —— 一个不行（限流、报错）自动换下一个。
+#
+# 想改优先级：改 .env 里 DSH_SUBAGENT_MODELS 的顺序，然后
+#   DSH_RENDER_FORCE=1 docker compose up -d
+#
+# 留空（DSH_SUBAGENT_MODELS 不填）= allowedModels 为空列表，
+# Agent 不能给子智能体选模型，全部跟随默认模型。
+- insert:
+    - id: subagent-model-selection-settings
+      name: '@deepseek-ai/dsh-tool-subagent/model-selection-settings'
+      config:
+        enabled: true
+        allowedModels: ${DSH_SUBAGENT_MODELS_FLOW}
+
+# ── Web 配置 → QQ 机器人 跟随（唯一的兼容层）─────────────────────
+#
+# QQ 机器人和 Web 是两个独立 profile、两个独立进程，配置各存各的：
+#   data/profiles/web/cordis.patch.yml    ← Web 设置页改这份
+#   data/profiles/qqbot/cordis.patch.yml  ← QQ 机器人读这份
+#
+# 所以「在 Web 里配服务商 / 选默认模型」对 QQ 机器人没有效果。
+# 这个插件每 5 秒比对一次，以 Web 为准把这些条目同步过来。
+#
+# 不同步 permission：qqbot 必须是 danger-full-access（容器里要读写文件、
+# 装包），跟 Web 同步会让机器人直接废掉。
+- insert:
+    - id: config-sync
+      name: './plugins/config-sync/index.js'
+      config:
+        intervalMs: 5000
+# ── 插件日志输出 ──────────────────────────────────────────────────
+# DSH 的 ctx.logger 只把日志交给注册过的 exporter，而 qqbot 这个 app
+# 一个都没装 —— 所有插件日志被静默丢弃。于是「群里没反应」时日志是空的，
+# 没法判断到底是没收到消息、被白名单拦了、还是触发了但选择不回。
+#
+# 这个插件把日志写到 stderr，`docker compose logs dsh` 就能看到。
+# 级别 threshold：2=只看 warn/error，3=加 debug（能看到 trigger/skip 原因）。
+# 嫌吵就把 level 调成 2。
+- insert:
+    - id: log-console
+      name: 'file:///home/node/.dsh/profiles/qqbot/plugins/log-console/index.js'
+      config:
+        level: 3
+
+# ── 默认工作区 ───────────────────────────────────────────────────
+#
+# QQ 插件建会话时只把 cwd 写进 meta，不写 workspaceId；而 Web 的会话
+# 列表是按 workspaceRegistry 分组的，registry 里没有对应记录，QQ 来的
+# 会话就显示「未分配工作区」。
+#
+# 这个插件启动时调 workspaceRegistry.initializeDefault('/workspace')：
+#   - 把 /workspace 注册成**默认工作区**（写 global.defaultWorkspaceId）
+#   - QQ 会话的 cwd 也是 /workspace，于是两边归到同一个工作区
+#
+# initializeDefault 只在 registry 和会话历史都为空时动手，重复调用无害。
+- insert:
+    - id: workspace-bootstrap
+      name: './plugins/workspace-bootstrap/index.js'
+      config:
+        directories:
+          - /workspace

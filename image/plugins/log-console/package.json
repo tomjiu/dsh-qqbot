@@ -1,0 +1,12 @@
+{
+  "name": "dsh-log-console",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "description": "把 DSH 内部 logger 的输出接到 stderr，让插件日志真的能被 docker logs 看到"
+}

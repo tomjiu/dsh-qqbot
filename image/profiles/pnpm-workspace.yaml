@@ -1,0 +1,31 @@
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false
+
+# meow-memory 来自 github，需要放行构建脚本
+allowBuilds:
+  - meow-memory@https://codeload.github.com/Phant0Meow/dsh-meow-memory/tar.gz/cd5501e5185223e174f6c99a4c8b29cd3fae38ca
+onlyBuiltDependencies:
+  - "meow-memory@https://codeload.github.com/Phant0Meow/dsh-meow-memory/tar.gz/cd5501e5185223e174f6c99a4c8b29cd3fae38ca"
+
+# QQ 插件补丁：拦截「纯内部任务」的轮次，避免 meow-memory 反思 / 插件提示
+# 之类的内容被当成聊天发到 QQ。
+# 生成方式见 tools/make-patch.sh；升级插件后需重新生成。
+patchedDependencies:
+  '@tencent-connect/dsh-qqbot@0.5.2': patches/@tencent-connect__dsh-qqbot@0.5.2.patch
+
+# 固定 pnpm store 位置。
+#
+# 不写死的话：构建期用的是默认的 ~/.local/share/pnpm/store，
+# 而运行期 data/profiles 变成宿主机挂载后，pnpm 会算出一个不同的
+# store 路径（/home/node/.dsh/profiles/.pnpm-store），于是拒绝复用
+# 已装好的 node_modules，任何 `dsh plugin add` 都失败：
+#
+#   pnpm now wants to use the store at "/home/node/.dsh/profiles/.pnpm-store/v10"
+#   This error may happen if the node_modules was installed with a
+#   different major version of pnpm
+#
+# 显式写死后两边一致，AI / 用户就能自己装插件了。
+storeDir: /home/node/.local/share/pnpm/store
